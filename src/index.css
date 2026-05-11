@@ -96,6 +96,11 @@ input, select, textarea {
   transition: all 0.2s ease;
 }
 
+select option {
+  background-color: #0f172a; /* Dark background for Firefox */
+  color: var(--text);
+}
+
 input:focus, select:focus, textarea:focus {
   outline: none;
   border-color: var(--primary);

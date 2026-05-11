@@ -7,7 +7,7 @@ import {
   Tag, Layers, ArrowRightLeft, Search
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { comparePrices } from './priceEngine';
+import { comparePrices, convertPrice, formatPrice, EXCHANGE_RATES, updateExchangeRates } from './priceEngine';
 
 const CATEGORIES = ['Electronics', 'Home', 'Clothing', 'Hobbies', 'Gifts', 'Other'];
 const PRIORITIES = [
@@ -30,10 +30,43 @@ const App = () => {
   const [searchTerm, setSearchTerm] = useState('');
   const [filterCategory, setFilterCategory] = useState('All');
   const [isRefreshing, setIsRefreshing] = useState(false);
+  const [baseCurrency, setBaseCurrency] = useState(() => {
+    return localStorage.getItem('buylist-base-currency') || 'USD';
+  });
+  const [currentRates, setCurrentRates] = useState(EXCHANGE_RATES);
+
+  useEffect(() => {
+    const loadRates = async () => {
+      const rates = await updateExchangeRates();
+      setCurrentRates({ ...rates });
+    };
+    loadRates();
+  }, []);
 
   useEffect(() => {
     localStorage.setItem('buylist-data', JSON.stringify(items));
   }, [items]);
+
+  useEffect(() => {
+    localStorage.setItem('buylist-base-currency', baseCurrency);
+  }, [baseCurrency]);
+
+  const getCheapestPrice = (links = []) => {
+    const prices = links
+      .map(l => parseFloat(l.price))
+      .filter(p => !isNaN(p));
+    return prices.length > 0 ? Math.min(...prices).toFixed(2) : '';
+  };
+
+  const getLinkPrice = (link) => {
+    const p = parseFloat(link.price);
+    return isNaN(p) ? Infinity : p;
+  };
+
+  const getSortedLinks = (item) => {
+    const links = item.links || [];
+    return [...links].sort((a, b) => getLinkPrice(a) - getLinkPrice(b));
+  };
 
   const addItem = () => {
     const newItem = {
@@ -44,7 +77,7 @@ const App = () => {
       status: 'wishlist',
       price: '',
       currency: 'USD',
-      links: [{ url: '', label: 'Main' }],
+      links: [{ url: '', label: 'Main', price: '' }],
       createdAt: new Date().toISOString(),
       lastChecked: null
     };
@@ -62,9 +95,11 @@ const App = () => {
   const addLink = (itemId) => {
     setItems(items.map(item => {
       if (item.id === itemId) {
+        const newLinks = [...item.links, { url: '', label: `Mirror ${item.links.length}`, price: '' }];
         return {
           ...item,
-          links: [...item.links, { url: '', label: `Mirror ${item.links.length}` }]
+          links: newLinks,
+          price: getCheapestPrice(newLinks)
         };
       }
       return item;
@@ -76,7 +111,11 @@ const App = () => {
       if (item.id === itemId) {
         const newLinks = [...item.links];
         newLinks[linkIndex] = { ...newLinks[linkIndex], ...updates };
-        return { ...item, links: newLinks };
+        return { 
+          ...item, 
+          links: newLinks,
+          price: getCheapestPrice(newLinks)
+        };
       }
       return item;
     }));
@@ -86,7 +125,11 @@ const App = () => {
     setItems(items.map(item => {
       if (item.id === itemId && item.links.length > 1) {
         const newLinks = item.links.filter((_, i) => i !== linkIndex);
-        return { ...item, links: newLinks };
+        return { 
+          ...item, 
+          links: newLinks,
+          price: getCheapestPrice(newLinks)
+        };
       }
       return item;
     }));
@@ -107,58 +150,35 @@ const App = () => {
     try {
       const updatedItems = await Promise.all(
         items.map(async (item) => {
-          if (!item.links?.length) {
-            return item;
-          }
+          if (!item.links?.length) return item;
 
           try {
-            const comparison =
-              await comparePrices(
-                item.links
-              );
+            const comparison = await comparePrices(item.links);
+            const cheapest = comparison.cheapest;
+            const oldPrice = parseFloat(item.price) || 0;
 
-            const cheapest =
-              comparison.cheapest;
-
-            const oldPrice =
-              parseFloat(item.price) || 0;
+            // Sync scraped prices back to the links
+            const updatedLinks = item.links.map(link => {
+              const result = comparison.prices.find(p => p.url === link.url);
+              if (result && result.success) {
+                return { ...link, price: result.price.toFixed(2) };
+              }
+              return link;
+            });
 
             return {
               ...item,
-
-              previousPrice:
-                oldPrice > 0
-                  ? oldPrice.toFixed(2)
-                  : null,
-
-              price:
-                cheapest?.price != null
-                  ? Number(cheapest.price).toFixed(2)
-                  : '',
-
-              currency:
-                cheapest?.currency ||
-                item.currency ||
-                'USD',
-
-              cheapestVendor:
-                cheapest?.label || null,
-
-              cheapestURL:
-                cheapest?.url || null,
-
-              priceData:
-                comparison.prices || [],
-
-              lastChecked:
-                new Date().toISOString()
+              links: updatedLinks,
+              previousPrice: oldPrice > 0 ? oldPrice.toFixed(2) : null,
+              price: cheapest?.price != null ? Number(cheapest.price).toFixed(2) : '',
+              currency: cheapest?.currency || item.currency || 'USD',
+              cheapestVendor: cheapest?.label || null,
+              cheapestURL: cheapest?.url || null,
+              priceData: comparison.prices || [],
+              lastChecked: new Date().toISOString()
             };
           } catch (err) {
-            console.error(
-              `Failed refreshing ${item.name}`,
-              err
-            );
-
+            console.error(`Failed refreshing ${item.name}`, err);
             return item;
           }
         })
@@ -208,8 +228,12 @@ const App = () => {
   }, [items, searchTerm, filterCategory]);
 
   const totalPrice = useMemo(() => {
-    return filteredItems.reduce((acc, item) => acc + (parseFloat(item.price) || 0), 0).toFixed(2);
-  }, [filteredItems]);
+    return filteredItems.reduce((acc, item) => {
+      const price = parseFloat(item.price) || 0;
+      const converted = convertPrice(price, item.currency || 'USD', baseCurrency);
+      return acc + converted;
+    }, 0).toFixed(2);
+  }, [filteredItems, baseCurrency]);
 
   return (
     <div className="container">
@@ -219,7 +243,58 @@ const App = () => {
           <p style={{ color: 'var(--text-muted)' }}>Track your desires across the web</p>
         </motion.div>
 
-        <div style={{ display: 'flex', gap: '12px' }}>
+        <div style={{ display: 'flex', gap: '12px', alignItems: 'center' }}>
+          <div className="tooltip-trigger" style={{ display: 'flex', alignItems: 'center', gap: '4px', background: 'rgba(255,255,255,0.05)', padding: '4px 12px', borderRadius: '8px', border: '1px solid var(--border)', cursor: 'help', position: 'relative' }}>
+            <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)', textTransform: 'uppercase' }}>Base:</span>
+            <div style={{ position: 'relative', display: 'flex', alignItems: 'center' }}>
+              <select 
+                value={baseCurrency} 
+                onChange={(e) => setBaseCurrency(e.target.value)}
+                style={{ 
+                  background: 'none', 
+                  border: 'none', 
+                  padding: '4px 20px 4px 4px', 
+                  fontSize: '0.85rem', 
+                  fontWeight: '600', 
+                  width: 'auto', 
+                  cursor: 'pointer',
+                  color: 'var(--text)',
+                  appearance: 'none',
+                  WebkitAppearance: 'none',
+                  MozAppearance: 'none'
+                }}
+              >
+                {['USD', 'EUR', 'GBP', 'CAD', 'AUD', 'JPY', 'CNY', 'HKD', 'BRL'].map(curr => (
+                  <option key={curr} value={curr} style={{ backgroundColor: '#0f172a', color: 'white' }}>{curr}</option>
+                ))}
+              </select>
+              <ChevronDown size={14} style={{ position: 'absolute', right: '0', pointerEvents: 'none', color: 'var(--text-muted)' }} />
+            </div>
+            <div className="tooltip-content glass card" style={{ 
+              position: 'absolute', 
+              top: '100%', 
+              right: '0', 
+              zIndex: 100, 
+              padding: '12px', 
+              marginTop: '8px', 
+              fontSize: '0.75rem',
+              width: '180px',
+              pointerEvents: 'none',
+              opacity: 0,
+              transition: 'opacity 0.2s ease'
+            }}>
+              <p style={{ fontWeight: '700', marginBottom: '8px', borderBottom: '1px solid var(--border)', paddingBottom: '4px' }}>Live Exchange Rates</p>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '4px' }}>
+                {['EUR', 'GBP', 'JPY', 'CAD', 'AUD'].map(curr => (
+                  <React.Fragment key={curr}>
+                    <span>1 USD =</span>
+                    <span style={{ color: 'var(--accent)', textAlign: 'right' }}>{currentRates[curr] ? currentRates[curr].toFixed(4) : '...'} {curr}</span>
+                  </React.Fragment>
+                ))}
+              </div>
+              <p style={{ marginTop: '8px', opacity: 0.5, fontStyle: 'italic' }}>Source: Open ER API</p>
+            </div>
+          </div>
           <button className="secondary" onClick={() => setIsEditing(!isEditing)}>
             {isEditing ? <Eye size={18} /> : <Edit3 size={18} />}
             {isEditing ? 'Preview' : 'Edit'}
@@ -259,8 +334,8 @@ const App = () => {
 
         <div style={{ marginLeft: 'auto', display: 'flex', gap: '24px', alignItems: 'center' }}>
           <div style={{ textAlign: 'right' }}>
-            <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '1px' }}>Total Budget</p>
-            <p style={{ fontSize: '1.5rem', fontWeight: '700', color: 'var(--accent)' }}>${totalPrice}</p>
+            <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '1px' }}>Total ({baseCurrency})</p>
+            <p style={{ fontSize: '1.5rem', fontWeight: '700', color: 'var(--accent)' }}>{formatPrice(totalPrice, baseCurrency)}</p>
           </div>
           <button className={`secondary ${isRefreshing ? 'animate-spin' : ''}`} onClick={refreshPrices} disabled={isRefreshing}>
             <RefreshCw size={18} /> Refresh Prices
@@ -304,28 +379,7 @@ const App = () => {
 
                   <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '16px' }}>
                     <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-                      <label style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>Price Tracking</label>
-                      <div style={{ display: 'flex', gap: '8px' }}>
-                        <div style={{ position: 'relative', flex: 1 }}>
-                          <DollarSign size={14} style={{ position: 'absolute', left: '10px', top: '50%', transform: 'translateY(-50%)', color: 'var(--text-muted)' }} />
-                          <input
-                            type="number"
-                            placeholder="0.00"
-                            style={{ width: '100%', paddingLeft: '30px' }}
-                            value={item.price}
-                            onChange={(e) => updateItem(item.id, { price: e.target.value })}
-                          />
-                        </div>
-                        <select style={{ width: '80px' }} value={item.currency} onChange={(e) => updateItem(item.id, { currency: e.target.value })}>
-                          <option value="USD">USD</option>
-                          <option value="EUR">EUR</option>
-                          <option value="GBP">GBP</option>
-                        </select>
-                      </div>
-                    </div>
-
-                    <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-                      <label style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>Priority & Status</label>
+                      <label style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>Status & Priority</label>
                       <div style={{ display: 'flex', gap: '8px' }}>
                         <select
                           style={{ flex: 1 }}
@@ -343,6 +397,15 @@ const App = () => {
                         </select>
                       </div>
                     </div>
+                    
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                      <label style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>Currency</label>
+                      <select style={{ width: '100%' }} value={item.currency} onChange={(e) => updateItem(item.id, { currency: e.target.value })}>
+                        <option value="USD">USD ($)</option>
+                        <option value="EUR">EUR (€)</option>
+                        <option value="GBP">GBP (£)</option>
+                      </select>
+                    </div>
                   </div>
 
                   <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
@@ -357,10 +420,20 @@ const App = () => {
                         <input
                           type="text"
                           placeholder="Label"
-                          style={{ width: '120px' }}
+                          style={{ width: '100px' }}
                           value={link.label}
                           onChange={(e) => updateLink(item.id, lIndex, { label: e.target.value })}
                         />
+                        <div style={{ position: 'relative', width: '90px' }}>
+                          <DollarSign size={12} style={{ position: 'absolute', left: '8px', top: '50%', transform: 'translateY(-50%)', color: 'var(--text-muted)' }} />
+                          <input
+                            type="number"
+                            placeholder="Price"
+                            style={{ width: '100%', paddingLeft: '24px', fontSize: '0.85rem' }}
+                            value={link.price || ''}
+                            onChange={(e) => updateLink(item.id, lIndex, { price: e.target.value })}
+                          />
+                        </div>
                         <input
                           type="text"
                           placeholder="https://..."
@@ -395,11 +468,16 @@ const App = () => {
                         {item.previousPrice && parseFloat(item.price) < parseFloat(item.previousPrice) && <span style={{ color: 'var(--accent)', fontSize: '0.8rem' }}>↓</span>}
                         {item.previousPrice && parseFloat(item.price) > parseFloat(item.previousPrice) && <span style={{ color: 'var(--danger)', fontSize: '0.8rem' }}>↑</span>}
                         <p style={{ fontSize: '1.25rem', fontWeight: '800', color: 'var(--accent)' }}>
-                          {item.price ? `${item.currency === 'EUR' ? '€' : item.currency === 'GBP' ? '£' : '$'}${item.price}` : '—'}
+                          {item.price ? formatPrice(item.price, item.currency) : '—'}
                         </p>
                       </div>
+                      {item.price && item.currency !== baseCurrency && (
+                        <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', marginTop: '-4px' }}>
+                          ≈ {formatPrice(convertPrice(item.price, item.currency, baseCurrency), baseCurrency)}
+                        </p>
+                      )}
                       {item.lastChecked && (
-                        <p style={{ fontSize: '0.65rem', color: 'var(--text-muted)' }}>
+                        <p style={{ fontSize: '0.65rem', color: 'var(--text-muted)', marginTop: '2px' }}>
                           Checked {new Date(item.lastChecked).toLocaleDateString()}
                         </p>
                       )}
@@ -420,31 +498,67 @@ const App = () => {
                     </div>
 
                     <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px' }}>
-                      {item.links.map((link, lIndex) => (
-                        <a
-                          key={lIndex}
-                          href={link.url}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="secondary"
-                          style={{
-                            textDecoration: 'none',
-                            padding: '8px 12px',
-                            borderRadius: '8px',
-                            fontSize: '0.85rem',
-                            background: lIndex === 0 ? 'rgba(99, 102, 241, 0.1)' : 'rgba(255, 255, 255, 0.05)',
-                            color: lIndex === 0 ? 'var(--primary)' : 'var(--text)',
-                            border: lIndex === 0 ? '1px solid rgba(99, 102, 241, 0.2)' : '1px solid var(--border)',
-                            display: 'flex',
-                            alignItems: 'center',
-                            gap: '6px'
-                          }}
-                        >
-                          <Link2 size={14} />
-                          {link.label || 'Link'}
-                          <ExternalLink size={12} style={{ opacity: 0.5 }} />
-                        </a>
-                      ))}
+                      {getSortedLinks(item).map((link, lIndex) => {
+                        const price = getLinkPrice(link);
+                        const isCheapest = lIndex === 0 && price !== Infinity;
+                        
+                        return (
+                          <a
+                            key={lIndex}
+                            href={link.url}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="secondary"
+                            style={{
+                              textDecoration: 'none',
+                              padding: '8px 12px',
+                              borderRadius: '8px',
+                              fontSize: '0.85rem',
+                              background:
+                                isCheapest
+                                  ? 'rgba(99, 102, 241, 0.15)'
+                                  : 'rgba(255, 255, 255, 0.05)',
+                              color:
+                                isCheapest
+                                  ? 'var(--primary)'
+                                  : 'var(--text)',
+                              border:
+                                isCheapest
+                                  ? '1px solid rgba(99, 102, 241, 0.35)'
+                                  : '1px solid var(--border)',
+                              display: 'flex',
+                              alignItems: 'center',
+                              gap: '6px',
+                              transform: isCheapest ? 'scale(1.02)' : 'none',
+                              transition: 'all 0.2s ease'
+                            }}
+                          >
+                            <Link2 size={14} />
+                            <span>{link.label || 'Link'}</span>
+                            
+                            {price !== Infinity && (
+                              <span style={{ fontWeight: '600', opacity: 0.9 }}>
+                                {formatPrice(price, item.currency)}
+                              </span>
+                            )}
+
+                            {isCheapest && (
+                              <span style={{
+                                fontSize: '0.65rem',
+                                opacity: 0.8,
+                                background: 'var(--primary)',
+                                color: 'white',
+                                padding: '1px 4px',
+                                borderRadius: '3px'
+                              }}>
+                                BEST
+                              </span>
+                            )}
+
+                            <ExternalLink size={12} style={{ opacity: 0.5 }} />
+                          </a>
+                        );
+                      })}
                     </div>
                   </div>
                 </div>
@@ -468,6 +582,10 @@ const App = () => {
         }
         .animate-spin {
           animation: spin 1s linear infinite;
+        }
+        .tooltip-trigger:hover .tooltip-content {
+          opacity: 1 !important;
+          pointer-events: auto !important;
         }
       `}</style>
     </div>

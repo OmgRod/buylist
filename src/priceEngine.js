@@ -3,6 +3,49 @@
 const EXTRACTORS = [];
 
 /* =========================
+   CURRENCY & EXCHANGE RATES
+========================= */
+
+export let EXCHANGE_RATES = {
+  USD: 1,
+  EUR: 0.92,
+  GBP: 0.79
+};
+
+export async function updateExchangeRates() {
+  try {
+    const response = await fetch('https://open.er-api.com/v6/latest/USD');
+    if (response.ok) {
+      const data = await response.json();
+      if (data.rates) {
+        EXCHANGE_RATES = data.rates;
+        console.log('[PriceEngine] Rates updated');
+        return data.rates;
+      }
+    }
+  } catch (err) {
+    console.error('[PriceEngine] API failed', err);
+  }
+  return EXCHANGE_RATES;
+}
+
+// Initial update
+updateExchangeRates();
+
+export function convertPrice(amount, from, to) {
+  if (!amount || from === to) return amount;
+  
+  const fromRate = EXCHANGE_RATES[from];
+  const toRate = EXCHANGE_RATES[to];
+  
+  if (!fromRate || !toRate) return amount;
+  
+  // Convert to USD first, then to target
+  const inUSD = amount / fromRate;
+  return inUSD * toRate;
+}
+
+/* =========================
    EXTRACTOR REGISTRATION
 ========================= */
 
@@ -37,21 +80,29 @@ function parseHTML(html) {
 
 async function fetchHTML(url) {
   try {
-    const response = await fetch(url, {
-      method: 'GET',
-      mode: 'cors',
-      headers: {
-        Accept: 'text/html'
-      }
-    });
+    // Amazon and other major retailers block direct automated requests and require CORS.
+    // We use a CORS proxy (allorigins) to bypass these restrictions.
+    const proxyUrl = `https://api.allorigins.win/get?disableCache=true&url=${encodeURIComponent(url)}`;
+
+    const response = await fetch(proxyUrl);
 
     if (!response.ok) {
-      throw new Error(
-        `HTTP ${response.status}`
-      );
+      throw new Error(`Proxy HTTP ${response.status}`);
     }
 
-    return await response.text();
+    const data = await response.json();
+    
+    if (!data || !data.contents) {
+      throw new Error('Proxy returned empty content');
+    }
+
+    // Check if we got a 503/403 block page even through the proxy
+    if (data.contents.includes('Service Unavailable Error') || data.contents.includes('api-services-support@amazon.com')) {
+      console.warn(`[PriceEngine] Amazon block detected for ${url}`);
+      return null;
+    }
+
+    return data.contents;
   } catch (err) {
     console.error(
       `[PriceEngine] Failed to fetch ${url}`,
@@ -79,48 +130,83 @@ function detectCurrency(text) {
 function genericExtractor(html) {
   const doc = parseHTML(html);
 
-  const selectors = [
+  // 1. Try Metadata/Structured Data
+  const metadataSelectors = [
     'meta[property="product:price:amount"]',
     'meta[property="og:price:amount"]',
+    'meta[property="price:amount"]',
     'meta[name="twitter:data1"]',
+    'script[type="application/ld+json"]'
+  ];
 
+  for (const selector of metadataSelectors) {
+    const el = doc.querySelector(selector);
+    if (!el) continue;
+
+    let text = el.getAttribute('content') || el.textContent;
+
+    // Special handling for JSON-LD
+    if (selector.includes('json')) {
+      try {
+        const json = JSON.parse(text);
+        // JSON-LD can be an object or an array
+        const findPrice = (obj) => {
+          if (obj.price) return obj.price;
+          if (obj.offers) {
+            if (Array.isArray(obj.offers)) return obj.offers[0].price;
+            return obj.offers.price;
+          }
+          return null;
+        };
+        const price = Array.isArray(json) ? findPrice(json[0]) : findPrice(json);
+        if (price) return { success: true, price: normalizePrice(String(price)), currency: detectCurrency(text), source: 'json-ld' };
+      } catch (e) { continue; }
+    }
+
+    const price = normalizePrice(text);
+    if (price) return { success: true, price, currency: detectCurrency(text), source: selector };
+  }
+
+  // 2. Try Common Class Names & IDs
+  const commonSelectors = [
     '[itemprop="price"]',
-
     '.price',
     '.product-price',
     '.current-price',
     '.sale-price',
     '.special-price',
-
+    '#price-block',
+    '#price_inside_buybox',
+    '.amount',
     '[data-price]',
-    '[data-product-price]'
+    '[data-product-price]',
+    '.largePriceTable td strong' // Added from image
   ];
 
-  for (const selector of selectors) {
-    const el = doc.querySelector(selector);
-
-    if (!el) continue;
-
-    const text =
-      el.getAttribute('content') ||
-      el.getAttribute('data-price') ||
-      el.textContent;
-
-    const price = normalizePrice(text);
-
-    if (price) {
-      return {
-        success: true,
-        price,
-        currency: detectCurrency(text),
-        source: selector
-      };
+  for (const selector of commonSelectors) {
+    const elements = doc.querySelectorAll(selector);
+    for (const el of elements) {
+      const text = el.getAttribute('content') || el.getAttribute('data-price') || el.textContent;
+      const price = normalizePrice(text);
+      if (price) return { success: true, price, currency: detectCurrency(text), source: selector };
     }
   }
 
-  return {
-    success: false
-  };
+  // 3. Last Resort: Regex search in body text
+  const bodyText = doc.body.textContent;
+  const priceRegex = /([£$€])\s?(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2}))/g;
+  let match;
+  const candidates = [];
+  while ((match = priceRegex.exec(bodyText)) !== null) {
+    candidates.push({ price: normalizePrice(match[2]), currency: detectCurrency(match[1]) });
+  }
+
+  if (candidates.length > 0) {
+    // Usually the largest or first valid price is the main one, but this is fuzzy
+    return { success: true, price: candidates[0].price, currency: candidates[0].currency, source: 'regex-fallback' };
+  }
+
+  return { success: false };
 }
 
 /* =========================
@@ -176,20 +262,60 @@ async function shopifyExtractor(url) {
 function amazonExtractor(html) {
   const doc = parseHTML(html);
 
+  // 1. Try to find the full price block
+  const priceContainer = doc.querySelector('.a-price');
+  if (priceContainer) {
+    // Try offscreen first (cleanest string)
+    const offscreen = priceContainer.querySelector('.a-offscreen');
+    if (offscreen && offscreen.textContent.trim()) {
+      const price = normalizePrice(offscreen.textContent);
+      if (price) return { success: true, price, currency: detectCurrency(offscreen.textContent), source: 'amazon-a-offscreen' };
+    }
+
+    // fallback to components if offscreen is empty or missing
+    const whole = priceContainer.querySelector('.a-price-whole');
+    const fraction = priceContainer.querySelector('.a-price-fraction');
+    const symbol = priceContainer.querySelector('.a-price-symbol');
+
+    if (whole) {
+      let priceStr = whole.textContent.replace(/[^\d]/g, '');
+      if (fraction) priceStr += '.' + fraction.textContent.replace(/[^\d]/g, '');
+      
+      const price = parseFloat(priceStr);
+      if (!isNaN(price)) {
+        return {
+          success: true,
+          price,
+          currency: detectCurrency(symbol?.textContent || '£'),
+          source: 'amazon-components'
+        };
+      }
+    }
+  }
+
   const selectors = [
+    // Global/Modern Selectors
     '.a-price .a-offscreen',
-    '.a-price-whole',
+    '.apexPriceToPay .a-offscreen',
+    '#price_inside_buybox',
+    '#corePrice_feature_div .a-offscreen',
+    '#corePriceDisplay_desktop_feature_div .a-offscreen',
+    
+    // UK/International Specifics
     '#priceblock_ourprice',
-    '#priceblock_dealprice'
+    '#priceblock_dealprice',
+    '#priceblock_saleprice',
+    
+    // Fallbacks
+    '.a-color-price',
+    'span[id^="priceblock_"]'
   ];
 
   for (const selector of selectors) {
     const el = doc.querySelector(selector);
-
     if (!el) continue;
 
     const text = el.textContent;
-
     const price = normalizePrice(text);
 
     if (price) {
@@ -197,14 +323,13 @@ function amazonExtractor(html) {
         success: true,
         price,
         currency: detectCurrency(text),
-        source: selector
+        source: `amazon-${selector}`
       };
     }
   }
 
-  return {
-    success: false
-  };
+  // If Amazon specific fails, try generic as it might catch JSON-LD or meta tags
+  return genericExtractor(html);
 }
 
 /* =========================
@@ -245,6 +370,33 @@ function ebayExtractor(html) {
 }
 
 /* =========================
+   CPC / FARNELL STYLE EXTRACTOR
+========================= */
+
+function cpcExtractor(html) {
+  const doc = parseHTML(html);
+  
+  // Specific selector from the user image
+  const el = doc.querySelector('#pricePanel .largePriceTable td strong') || 
+             doc.querySelector('.largePriceTable td strong');
+             
+  if (el) {
+    const text = el.textContent;
+    const price = normalizePrice(text);
+    if (price) {
+      return {
+        success: true,
+        price,
+        currency: detectCurrency(text),
+        source: 'cpc-largePriceTable'
+      };
+    }
+  }
+  
+  return genericExtractor(html);
+}
+
+/* =========================
    REGISTER EXTRACTORS
 ========================= */
 
@@ -275,6 +427,16 @@ registerExtractor({
 
   extract: async (url, html) => {
     return ebayExtractor(html);
+  }
+});
+
+registerExtractor({
+  name: 'CPC/Farnell',
+  test: (url) =>
+    url.includes('cpc.farnell.com') || url.includes('farnell.com'),
+
+  extract: async (url, html) => {
+    return cpcExtractor(html);
   }
 });
 
@@ -340,14 +502,34 @@ export async function comparePrices(
 ) {
   const results = await Promise.all(
     links.map(async (link) => {
-      const result = await getPrice(
-        link.url
-      );
+      // If we have a URL, prioritize scraping it
+      if (link.url) {
+        const result = await getPrice(link.url);
+        if (result.success) {
+          return {
+            label: link.label || 'Store',
+            url: link.url,
+            ...result
+          };
+        }
+      }
+
+      // If scraping fails or no URL, fall back to the manually entered price
+      if (link.price && !isNaN(parseFloat(link.price))) {
+        return {
+          label: link.label || 'Store',
+          url: link.url,
+          success: true,
+          price: parseFloat(link.price),
+          source: 'manual'
+        };
+      }
 
       return {
         label: link.label || 'Store',
         url: link.url,
-        ...result
+        success: false,
+        reason: link.url ? 'fetch-failed' : 'no-url'
       };
     })
   );
@@ -441,17 +623,19 @@ export function formatPrice(
   value,
   currency = 'USD'
 ) {
-  if (value == null) return '—';
+  if (value == null || isNaN(parseFloat(value))) return '—';
 
-  const symbols = {
-    USD: '$',
-    GBP: '£',
-    EUR: '€'
-  };
-
-  return `${
-    symbols[currency] || '$'
-  }${Number(value).toFixed(2)}`;
+  try {
+    return new Intl.NumberFormat('en-US', {
+      style: 'currency',
+      currency: currency,
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2
+    }).format(value);
+  } catch (e) {
+    // Fallback if currency code is invalid
+    return `${currency} ${Number(value).toFixed(2)}`;
+  }
 }
 
 /* =========================
