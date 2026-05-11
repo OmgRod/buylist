@@ -1,12 +1,13 @@
 import React, { useState, useEffect, useMemo } from 'react';
-import { 
-  Plus, Trash2, ExternalLink, RefreshCw, 
-  ChevronUp, ChevronDown, Download, Upload, 
-  Eye, Edit3, ShoppingCart, CheckCircle, 
+import {
+  Plus, Trash2, ExternalLink, RefreshCw,
+  ChevronUp, ChevronDown, Download, Upload,
+  Eye, Edit3, ShoppingCart, CheckCircle,
   Clock, AlertTriangle, Link2, DollarSign,
   Tag, Layers, ArrowRightLeft, Search
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
+import { comparePrices } from './priceEngine';
 
 const CATEGORIES = ['Electronics', 'Home', 'Clothing', 'Hobbies', 'Gifts', 'Other'];
 const PRIORITIES = [
@@ -22,7 +23,7 @@ const STATUSES = [
 
 const App = () => {
   const [items, setItems] = useState(() => {
-    const saved = localStorage.getItem('buylist-pro-data');
+    const saved = localStorage.getItem('buylist-data');
     return saved ? JSON.parse(saved) : [];
   });
   const [isEditing, setIsEditing] = useState(true);
@@ -31,7 +32,7 @@ const App = () => {
   const [isRefreshing, setIsRefreshing] = useState(false);
 
   useEffect(() => {
-    localStorage.setItem('buylist-pro-data', JSON.stringify(items));
+    localStorage.setItem('buylist-data', JSON.stringify(items));
   }, [items]);
 
   const addItem = () => {
@@ -100,21 +101,78 @@ const App = () => {
     }
   };
 
-  const simulatePriceRefresh = () => {
+  const refreshPrices = async () => {
     setIsRefreshing(true);
-    setTimeout(() => {
-      setItems(items.map(item => {
-        const oldPrice = parseFloat(item.price) || 0;
-        const newPrice = item.price ? (oldPrice * (0.95 + Math.random() * 0.1)).toFixed(2) : item.price;
-        return {
-          ...item,
-          previousPrice: oldPrice > 0 ? oldPrice.toFixed(2) : null,
-          price: newPrice,
-          lastChecked: new Date().toISOString(),
-        };
-      }));
-      setIsRefreshing(false);
-    }, 1500);
+
+    try {
+      const updatedItems = await Promise.all(
+        items.map(async (item) => {
+          if (!item.links?.length) {
+            return item;
+          }
+
+          try {
+            const comparison =
+              await comparePrices(
+                item.links
+              );
+
+            const cheapest =
+              comparison.cheapest;
+
+            const oldPrice =
+              parseFloat(item.price) || 0;
+
+            return {
+              ...item,
+
+              previousPrice:
+                oldPrice > 0
+                  ? oldPrice.toFixed(2)
+                  : null,
+
+              price:
+                cheapest?.price != null
+                  ? Number(cheapest.price).toFixed(2)
+                  : '',
+
+              currency:
+                cheapest?.currency ||
+                item.currency ||
+                'USD',
+
+              cheapestVendor:
+                cheapest?.label || null,
+
+              cheapestURL:
+                cheapest?.url || null,
+
+              priceData:
+                comparison.prices || [],
+
+              lastChecked:
+                new Date().toISOString()
+            };
+          } catch (err) {
+            console.error(
+              `Failed refreshing ${item.name}`,
+              err
+            );
+
+            return item;
+          }
+        })
+      );
+
+      setItems(updatedItems);
+    } catch (err) {
+      console.error(
+        'Global refresh failed',
+        err
+      );
+    }
+
+    setIsRefreshing(false);
   };
 
   const exportData = () => {
@@ -122,7 +180,7 @@ const App = () => {
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `buylist-pro-${new Date().toISOString().split('T')[0]}.json`;
+    a.download = `buylist-${new Date().toISOString().split('T')[0]}.json`;
     a.click();
   };
 
@@ -157,10 +215,10 @@ const App = () => {
     <div className="container">
       <header style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '40px' }}>
         <motion.div initial={{ x: -20, opacity: 0 }} animate={{ x: 0, opacity: 1 }}>
-          <h1>BuyList Pro</h1>
+          <h1>BuyList</h1>
           <p style={{ color: 'var(--text-muted)' }}>Track your desires across the web</p>
         </motion.div>
-        
+
         <div style={{ display: 'flex', gap: '12px' }}>
           <button className="secondary" onClick={() => setIsEditing(!isEditing)}>
             {isEditing ? <Eye size={18} /> : <Edit3 size={18} />}
@@ -182,15 +240,15 @@ const App = () => {
       <section className="glass card" style={{ marginBottom: '32px', display: 'flex', flexWrap: 'wrap', gap: '20px', alignItems: 'center' }}>
         <div style={{ position: 'relative', flex: 1, minWidth: '250px' }}>
           <Search size={18} style={{ position: 'absolute', left: '12px', top: '50%', transform: 'translateY(-50%)', color: 'var(--text-muted)' }} />
-          <input 
-            type="text" 
-            placeholder="Search items..." 
+          <input
+            type="text"
+            placeholder="Search items..."
             style={{ width: '100%', paddingLeft: '40px' }}
             value={searchTerm}
             onChange={(e) => setSearchTerm(e.target.value)}
           />
         </div>
-        
+
         <div style={{ display: 'flex', gap: '12px', alignItems: 'center' }}>
           <Tag size={18} style={{ color: 'var(--text-muted)' }} />
           <select value={filterCategory} onChange={(e) => setFilterCategory(e.target.value)}>
@@ -204,7 +262,7 @@ const App = () => {
             <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '1px' }}>Total Budget</p>
             <p style={{ fontSize: '1.5rem', fontWeight: '700', color: 'var(--accent)' }}>${totalPrice}</p>
           </div>
-          <button className={`secondary ${isRefreshing ? 'animate-spin' : ''}`} onClick={simulatePriceRefresh} disabled={isRefreshing}>
+          <button className={`secondary ${isRefreshing ? 'animate-spin' : ''}`} onClick={refreshPrices} disabled={isRefreshing}>
             <RefreshCw size={18} /> Refresh Prices
           </button>
         </div>
@@ -213,7 +271,7 @@ const App = () => {
       <div className={isEditing ? '' : 'grid'}>
         <AnimatePresence mode="popLayout">
           {filteredItems.map((item, index) => (
-            <motion.div 
+            <motion.div
               key={item.id}
               layout
               initial={{ scale: 0.9, opacity: 0 }}
@@ -231,9 +289,9 @@ const App = () => {
                       <button className="secondary" style={{ padding: '4px' }} onClick={() => moveItem(index, -1)}><ChevronUp size={16} /></button>
                       <button className="secondary" style={{ padding: '4px' }} onClick={() => moveItem(index, 1)}><ChevronDown size={16} /></button>
                     </div>
-                    <input 
-                      type="text" 
-                      placeholder="Item Name" 
+                    <input
+                      type="text"
+                      placeholder="Item Name"
                       style={{ fontSize: '1.2rem', fontWeight: '600', flex: 1 }}
                       value={item.name}
                       onChange={(e) => updateItem(item.id, { name: e.target.value })}
@@ -250,9 +308,9 @@ const App = () => {
                       <div style={{ display: 'flex', gap: '8px' }}>
                         <div style={{ position: 'relative', flex: 1 }}>
                           <DollarSign size={14} style={{ position: 'absolute', left: '10px', top: '50%', transform: 'translateY(-50%)', color: 'var(--text-muted)' }} />
-                          <input 
-                            type="number" 
-                            placeholder="0.00" 
+                          <input
+                            type="number"
+                            placeholder="0.00"
                             style={{ width: '100%', paddingLeft: '30px' }}
                             value={item.price}
                             onChange={(e) => updateItem(item.id, { price: e.target.value })}
@@ -269,16 +327,16 @@ const App = () => {
                     <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
                       <label style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>Priority & Status</label>
                       <div style={{ display: 'flex', gap: '8px' }}>
-                        <select 
-                          style={{ flex: 1 }} 
-                          value={item.priority} 
+                        <select
+                          style={{ flex: 1 }}
+                          value={item.priority}
                           onChange={(e) => updateItem(item.id, { priority: e.target.value })}
                         >
                           {PRIORITIES.map(p => <option key={p.value} value={p.value}>{p.label}</option>)}
                         </select>
-                        <select 
-                          style={{ flex: 1 }} 
-                          value={item.status} 
+                        <select
+                          style={{ flex: 1 }}
+                          value={item.status}
                           onChange={(e) => updateItem(item.id, { status: e.target.value })}
                         >
                           {STATUSES.map(s => <option key={s.value} value={s.value}>{s.label}</option>)}
@@ -296,16 +354,16 @@ const App = () => {
                     </div>
                     {item.links.map((link, lIndex) => (
                       <div key={lIndex} style={{ display: 'flex', gap: '8px' }}>
-                        <input 
-                          type="text" 
-                          placeholder="Label" 
+                        <input
+                          type="text"
+                          placeholder="Label"
                           style={{ width: '120px' }}
                           value={link.label}
                           onChange={(e) => updateLink(item.id, lIndex, { label: e.target.value })}
                         />
-                        <input 
-                          type="text" 
-                          placeholder="https://..." 
+                        <input
+                          type="text"
+                          placeholder="https://..."
                           style={{ flex: 1 }}
                           value={link.url}
                           onChange={(e) => updateLink(item.id, lIndex, { url: e.target.value })}
@@ -363,16 +421,16 @@ const App = () => {
 
                     <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px' }}>
                       {item.links.map((link, lIndex) => (
-                        <a 
+                        <a
                           key={lIndex}
-                          href={link.url} 
-                          target="_blank" 
+                          href={link.url}
+                          target="_blank"
                           rel="noopener noreferrer"
                           className="secondary"
-                          style={{ 
-                            textDecoration: 'none', 
-                            padding: '8px 12px', 
-                            borderRadius: '8px', 
+                          style={{
+                            textDecoration: 'none',
+                            padding: '8px 12px',
+                            borderRadius: '8px',
                             fontSize: '0.85rem',
                             background: lIndex === 0 ? 'rgba(99, 102, 241, 0.1)' : 'rgba(255, 255, 255, 0.05)',
                             color: lIndex === 0 ? 'var(--primary)' : 'var(--text)',
@@ -394,7 +452,7 @@ const App = () => {
             </motion.div>
           ))}
         </AnimatePresence>
-        
+
         {filteredItems.length === 0 && (
           <div style={{ gridColumn: '1/-1', textAlign: 'center', padding: '100px 0', color: 'var(--text-muted)' }}>
             <Layers size={48} style={{ marginBottom: '16px', opacity: 0.2 }} />
